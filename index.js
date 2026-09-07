@@ -19,7 +19,7 @@ const rubikaBase = `https://botapi.rubika.ir/v3/${rubikaToken}`;
 let offsetId = null;
 
 async function askQwen(userMessage) {
-await new Promise(resolve => setTimeout(resolve, 3000));
+await new Promise(resolve => setTimeout(resolve, 10000));
   const response = await axios.post(
     "https://api.b.ai/v1/chat/completions",
     {
