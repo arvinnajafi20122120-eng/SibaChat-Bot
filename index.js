@@ -833,7 +833,67 @@ async function processMessage(
 async function startBot() {
   console.log("🤖 سیباچت در حال اجراست...");
 
-  let firstSuccessfulPoll = true;
+  // ----------------------------------------------------------
+  // Startup drain:
+  // پیام‌های قبلی را فقط می‌خوانیم و offset را جلو می‌بریم،
+  // ولی آنها را پردازش نمی‌کنیم.
+  // وقتی صف خالی شد، از آن لحظه پیام‌های جدید پردازش می‌شوند.
+  // ----------------------------------------------------------
+
+  let initialized = false;
+
+  while (!initialized) {
+    try {
+      const result = await getUpdates();
+
+      if (result?.status !== "OK") {
+        console.log(
+          "⚠️ Startup getUpdates:",
+          JSON.stringify(result, null, 2)
+        );
+
+        await sleep(3000);
+        continue;
+      }
+
+      const updates = result.data?.updates || [];
+      const nextOffsetId = result.data?.next_offset_id || null;
+
+      // Offset را جلو می‌بریم تا پیام‌های موجود دوباره برنگردند
+      if (nextOffsetId) {
+        offsetId = nextOffsetId;
+        saveOffset(offsetId);
+      }
+
+      if (updates.length === 0) {
+        initialized = true;
+
+        console.log(
+          "✅ صف پیام‌های قبلی خالی شد."
+        );
+
+        console.log(
+          "🟢 سیباچت از این لحظه پیام‌های جدید را پردازش می‌کند."
+        );
+      } else {
+        console.log(
+          `⏭ ${updates.length} پیام قدیمی رد شد.`
+        );
+      }
+
+    } catch (error) {
+      console.error(
+        "❌ خطا هنگام پاک‌سازی صف قدیمی:",
+        error.response?.data || error.message
+      );
+
+      await sleep(3000);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // MAIN LOOP
+  // ----------------------------------------------------------
 
   while (true) {
     try {
@@ -852,44 +912,20 @@ async function startBot() {
       const updates = result.data?.updates || [];
       const nextOffsetId = result.data?.next_offset_id || null;
 
-      // ========================================================
-      // FIRST START
-      // ========================================================
-      //
-      // اگر offset از قبل نداشته‌ایم، پیام‌های موجود در صف را
-      // پردازش نمی‌کنیم. فقط offset فعلی را ذخیره می‌کنیم.
-      //
-      // به این ترتیب پیام‌های قدیمی بعد از Deploy دوباره پاسخ
-      // نمی‌گیرند.
-      // ========================================================
-
-      if (firstSuccessfulPoll) {
-        firstSuccessfulPoll = false;
-
-        if (nextOffsetId) {
-          offsetId = nextOffsetId;
-          saveOffset(offsetId);
-
-          console.log(
-            "⏭ پیام‌های قبلی رد شدند؛ از پیام‌های جدید شروع می‌کنیم."
-          );
-        }
-
-        continue;
-      }
-
-      // ========================================================
-      // UPDATE OFFSET
-      // ========================================================
-
+      // Offset جدید
       if (nextOffsetId) {
         offsetId = nextOffsetId;
         saveOffset(offsetId);
       }
 
-      // ========================================================
+      // هیچ پیام جدیدی نیست
+      if (updates.length === 0) {
+        continue;
+      }
+
+      // --------------------------------------------------------
       // PROCESS NEW MESSAGES
-      // ========================================================
+      // --------------------------------------------------------
 
       for (const update of updates) {
         if (update.type !== "NewMessage") {
@@ -932,10 +968,7 @@ async function startBot() {
 
     } catch (error) {
       console.error(
-        "❌ خطا در دریافت پیام‌ها:"
-      );
-
-      console.error(
+        "❌ خطا در دریافت پیام‌ها:",
         error.response?.data ||
         error.message
       );
