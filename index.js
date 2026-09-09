@@ -831,80 +831,82 @@ async function processMessage(
 // ============================================================
 
 async function startBot() {
-  console.log(
-    "🤖 سیباچت در حال اجراست..."
-  );
+  console.log("🤖 سیباچت در حال اجراست...");
+
+  let firstSuccessfulPoll = true;
 
   while (true) {
     try {
-      const result =
-        await getUpdates();
+      const result = await getUpdates();
 
-      if (
-        result?.status !== "OK"
-      ) {
+      if (result?.status !== "OK") {
         console.log(
           "⚠️ getUpdates:",
-          JSON.stringify(
-            result,
-            null,
-            2
-          )
+          JSON.stringify(result, null, 2)
         );
 
         await sleep(3000);
+        continue;
+      }
+
+      const updates = result.data?.updates || [];
+      const nextOffsetId = result.data?.next_offset_id || null;
+
+      // ========================================================
+      // FIRST START
+      // ========================================================
+      //
+      // اگر offset از قبل نداشته‌ایم، پیام‌های موجود در صف را
+      // پردازش نمی‌کنیم. فقط offset فعلی را ذخیره می‌کنیم.
+      //
+      // به این ترتیب پیام‌های قدیمی بعد از Deploy دوباره پاسخ
+      // نمی‌گیرند.
+      // ========================================================
+
+      if (firstSuccessfulPoll) {
+        firstSuccessfulPoll = false;
+
+        if (nextOffsetId) {
+          offsetId = nextOffsetId;
+          saveOffset(offsetId);
+
+          console.log(
+            "⏭ پیام‌های قبلی رد شدند؛ از پیام‌های جدید شروع می‌کنیم."
+          );
+        }
 
         continue;
       }
 
-      const updates =
-        result.data?.updates || [];
+      // ========================================================
+      // UPDATE OFFSET
+      // ========================================================
 
-      // ------------------------------------------------------
-      // ذخیره offset جدید
-      // ------------------------------------------------------
-
-      if (
-        result.data?.next_offset_id
-      ) {
-        offsetId =
-          result.data.next_offset_id;
-
-        saveOffset(
-          offsetId
-        );
+      if (nextOffsetId) {
+        offsetId = nextOffsetId;
+        saveOffset(offsetId);
       }
 
-      // ------------------------------------------------------
-      // پردازش پیام‌ها
-      // ------------------------------------------------------
+      // ========================================================
+      // PROCESS NEW MESSAGES
+      // ========================================================
 
-      for (
-        const update of updates
-      ) {
-        if (
-          update.type !==
-          "NewMessage"
-        ) {
+      for (const update of updates) {
+        if (update.type !== "NewMessage") {
           continue;
         }
 
-        const chatId =
-          update.chat_id;
+        const chatId = update.chat_id;
 
         const userText =
-          update.new_message?.text
-            ?.trim();
+          update.new_message?.text?.trim();
 
-        if (
-          !chatId ||
-          !userText
-        ) {
+        if (!chatId || !userText) {
           continue;
         }
 
         console.log(
-          `📩 پیام: ${userText}`
+          `📩 پیام جدید: ${userText}`
         );
 
         try {
@@ -915,10 +917,19 @@ async function startBot() {
         } catch (error) {
           console.error(
             "❌ خطای پردازش پیام:",
+            error.response?.data ||
             error.message
           );
+
+          try {
+            await sendMessage(
+              chatId,
+              "❌ در پردازش پیام مشکلی پیش آمد."
+            );
+          } catch (_) {}
         }
       }
+
     } catch (error) {
       console.error(
         "❌ خطا در دریافت پیام‌ها:"
