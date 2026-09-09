@@ -1,2 +1,6 @@
 node_modules
 .env
+offset.json
+generated.png
+.env
+node_modules/
