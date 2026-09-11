@@ -324,8 +324,7 @@ async function generateImage(prompt) {
 // ============================================================
 
 async function askQwen(userMessage) {
-  await sleep(1000);
-
+ await sleep(100);
   const response = await axios.post(
     "https://api.b.ai/v1/chat/completions",
     {
@@ -946,25 +945,21 @@ async function startBot() {
           `📩 پیام جدید: ${userText}`
         );
 
-        try {
-          await processMessage(
-            chatId,
-            userText
-          );
-        } catch (error) {
-          console.error(
-            "❌ خطای پردازش پیام:",
-            error.response?.data ||
-            error.message
-          );
+       processMessage(
+  chatId,
+  userText
+).catch(error => {
+  console.error(
+    "❌ خطای پردازش پیام:",
+    error.response?.data ||
+    error.message
+  );
 
-          try {
-            await sendMessage(
-              chatId,
-              "❌ در پردازش پیام مشکلی پیش آمد."
-            );
-          } catch (_) {}
-        }
+  sendMessage(
+    chatId,
+    "❌ در پردازش پیام مشکلی پیش آمد."
+  ).catch(() => {});
+});
       }
 
     } catch (error) {
