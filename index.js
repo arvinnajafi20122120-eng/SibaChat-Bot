@@ -689,6 +689,7 @@ async function processMessage(
     "🔍 IMAGE CHECK:",
     imageRequest
   );
+console.log("USER TEXT DEBUG:", JSON.stringify(userText));
 
   // ==========================================================
   // IMAGE MODE
