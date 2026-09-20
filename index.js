@@ -4,22 +4,17 @@ const FormData = require("form-data");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+
 // ============================================================
-// ENV
+// ENV VALIDATION
 // ============================================================
 
 const rubikaToken = process.env.RUBIKA_BOT_TOKEN;
-const baiApiKey = process.env.BAI_API_KEY;
 const cloudflareAccountId = process.env.CLOUDFLARE_ACCOUNT_ID;
 const cloudflareApiToken = process.env.CLOUDFLARE_API_TOKEN;
 
 if (!rubikaToken) {
   console.error("❌ RUBIKA_BOT_TOKEN تنظیم نشده");
-  process.exit(1);
-}
-
-if (!baiApiKey) {
-  console.error("❌ BAI_API_KEY تنظیم نشده");
   process.exit(1);
 }
 
@@ -34,26 +29,33 @@ if (!cloudflareApiToken) {
 }
 
 // ============================================================
-// CONFIG
+// CONFIG & CONSTANTS
 // ============================================================
 
-const rubikaBase = `https://botapi.rubika.ir/v3/${rubikaToken}`;
-
+const RUBIKA_BASE = `https://botapi.rubika.ir/v3/${rubikaToken}`;
 const OFFSET_FILE = path.join(__dirname, "offset.json");
 const GENERATED_IMAGE_FILE = path.join(__dirname, "generated.png");
+
+const CF_AI_BASE = `https://api.cloudflare.com/client/v4/accounts/${cloudflareAccountId}/ai/run`;
+const TEXT_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+const IMAGE_MODEL = "@cf/black-forest-labs/flux-2-klein-4b";
+
+const SYSTEM_PROMPT = `You are SIBA, the AI assistant of the SIBAK ecosystem.
+Answer users in Persian unless they ask another language.
+Be helpful, accurate and concise.`;
 
 let offsetId = null;
 
 // ============================================================
-// OFFSET
+// OFFSET MANAGEMENT
 // ============================================================
 
 try {
   if (fs.existsSync(OFFSET_FILE)) {
-    offsetId = fs.readFileSync(OFFSET_FILE, "utf8").trim() || null;
-
-    if (offsetId) {
-      console.log("♻️ Offset قبلی بازیابی شد");
+    const stored = fs.readFileSync(OFFSET_FILE, "utf8").trim();
+    if (stored) {
+      offsetId = stored;
+      console.log("♻️ Offset قبلی بازیابی شد:", offsetId);
     }
   }
 } catch (error) {
@@ -77,11 +79,16 @@ function sleep(ms) {
 }
 
 function safeString(value) {
-  if (value === undefined || value === null) {
-    return "";
-  }
-
+  if (value === undefined || value === null) return "";
   return String(value);
+}
+
+function looksMostlyEnglish(text) {
+  const value = safeString(text);
+  if (!value) return false;
+  const englishChars = (value.match(/[a-zA-Z]/g) || []).length;
+  const persianChars = (value.match(/[\u0600-\u06FF]/g) || []).length;
+  return englishChars > 5 && englishChars >= persianChars * 2;
 }
 
 // ============================================================
@@ -90,63 +97,25 @@ function safeString(value) {
 
 function isImageRequest(text) {
   const value = safeString(text).trim().toLowerCase();
-
-  if (!value) {
-    return false;
-  }
+  if (!value) return false;
 
   const patterns = [
-    "/image",
-    "/img",
-    "/photo",
-
-    "generate image",
-    "create image",
-    "make an image",
-    "make image",
-    "generate a picture",
-    "create a picture",
-    "make a picture",
-    "generate picture",
-    "create picture",
-
-    "عکس بساز",
-    "تصویر بساز",
-    "یه عکس بساز",
-    "یک عکس بساز",
-    "یه تصویر بساز",
-    "یک تصویر بساز",
-
-    "عکس تولید کن",
-    "تصویر تولید کن",
-    "عکس ایجاد کن",
-    "تصویر ایجاد کن",
-
-    "عکس درست کن",
-    "تصویر درست کن",
-
-    "عکس بکش",
-    "تصویر بکش",
-
-    "ساخت عکس",
-    "ساخت تصویر",
-    "تصویرسازی",
-
-    "یه عکس",
-    "یک عکس",
-    "یه تصویر",
-    "یک تصویر",
-
-    "رندر بساز",
-    "رندر کن"
+    "/image", "/img", "/photo",
+    "generate image", "create image", "make an image", "make image",
+    "generate a picture", "create a picture", "make a picture",
+    "generate picture", "create picture",
+    "عکس بساز", "تصویر بساز", "یه عکس بساز", "یک عکس بساز",
+    "یه تصویر بساز", "یک تصویر بساز",
+    "عکس تولید کن", "تصویر تولید کن", "عکس ایجاد کن", "تصویر ایجاد کن",
+    "عکس درست کن", "تصویر درست کن",
+    "عکس بکش", "تصویر بکش",
+    "ساخت عکس", "ساخت تصویر", "تصویرسازی",
+    "یه عکس", "یک عکس", "یه تصویر", "یک تصویر",
+    "رندر بساز", "رندر کن"
   ];
 
   return patterns.some((pattern) => value.includes(pattern));
 }
-
-// ============================================================
-// EXTRACT IMAGE PROMPT
-// ============================================================
 
 function extractImagePrompt(text) {
   let prompt = safeString(text).trim();
@@ -167,30 +136,53 @@ function extractImagePrompt(text) {
     ""
   );
 
-  prompt = prompt.replace(/\s+/g, " ").trim();
-
-  return prompt;
+  return prompt.replace(/\s+/g, " ").trim();
 }
 
 // ============================================================
-// SIMPLE ENGLISH DETECTION
+// CLOUDFLARE TEXT AI (LLAMA 3.1)
 // ============================================================
 
-function looksMostlyEnglish(text) {
-  const value = safeString(text);
+async function askAI(userMessage) {
+  console.log("☁️ درخواست متنی به Cloudflare AI...");
 
-  if (!value) {
-    return false;
+  try {
+    const response = await axios.post(
+      `${CF_AI_BASE}/${TEXT_MODEL}`,
+      {
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userMessage }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${cloudflareApiToken}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 60000
+      }
+    );
+
+    if (!response.data?.success) {
+      throw new Error(JSON.stringify(response.data));
+    }
+
+    const answer = response.data?.result?.response;
+    if (!answer) throw new Error("پاسخ خالی از Cloudflare دریافت شد.");
+
+    console.log("✅ پاسخ متنی دریافت شد");
+    return answer;
+
+  } catch (error) {
+    const msg = error.response?.data || error.message;
+    console.error("❌ خطا در Cloudflare Text AI:", msg);
+    throw new Error("خطا در ارتباط با هوش مصنوعی متنی.");
   }
-
-  const englishChars = (value.match(/[a-zA-Z]/g) || []).length;
-  const persianChars = (value.match(/[\u0600-\u06FF]/g) || []).length;
-
-  return englishChars > 5 && englishChars >= persianChars * 2;
 }
 
 // ============================================================
-// QWEN IMAGE PROMPT
+// CLOUDFLARE IMAGE PROMPT TRANSLATOR (USING SAME LLAMA MODEL)
 // ============================================================
 
 async function createImagePrompt(userText) {
@@ -200,7 +192,6 @@ async function createImagePrompt(userText) {
     return "A high quality cinematic image, professional composition, detailed lighting";
   }
 
-  // اگر درخواست از قبل انگلیسی باشد، مستقیم استفاده می‌کنیم
   if (looksMostlyEnglish(directPrompt)) {
     return directPrompt;
   }
@@ -209,63 +200,43 @@ async function createImagePrompt(userText) {
 
   try {
     const response = await axios.post(
-      "https://api.b.ai/v1/chat/completions",
+      `${CF_AI_BASE}/${TEXT_MODEL}`,
       {
-        model: "qwen3.8-flash",
-
         messages: [
           {
             role: "system",
-            content: `
-You are an expert AI image prompt engineer.
-
+            content: `You are an expert AI image prompt engineer.
 Convert the user's Persian image request into ONE excellent English image-generation prompt.
-
 Rules:
 - Output ONLY the final English prompt.
 - Do not explain anything.
-- Do not mention AI, APIs, prompts, or limitations.
 - Make the image visually rich and precise.
 - Preserve the user's main idea.
-- Add useful details about composition, lighting, materials, camera, atmosphere and quality when appropriate.
-- Never replace the user's subject with something unrelated.
-`
+- Add useful details about composition, lighting, materials, camera, atmosphere and quality when appropriate.`
           },
-
-          {
-            role: "user",
-            content: directPrompt
-          }
+          { role: "user", content: directPrompt }
         ]
       },
-
       {
         headers: {
-          Authorization: `Bearer ${baiApiKey}`,
+          Authorization: `Bearer ${cloudflareApiToken}`,
           "Content-Type": "application/json"
         },
-
-        timeout: 30000
+        timeout: 60000
       }
     );
 
-    const result =
-      response.data?.choices?.[0]?.message?.content?.trim();
-
+    const result = response.data?.result?.response?.trim();
     if (result) {
       console.log("✅ Prompt انگلیسی ساخته شد");
       return result;
     }
 
-    console.log("⚠️ Qwen پرامپت خالی برگرداند");
+    console.log("⚠️ پرامپت خالی برگردانده شد، استفاده از fallback");
   } catch (error) {
-    console.error(
-      "⚠️ خطا در ساخت Prompt:",
-      error.response?.data || error.message
-    );
+    console.error("⚠️ خطا در ساخت Prompt:", error.response?.data || error.message);
   }
 
-  // fallback
   return `${directPrompt}, high quality 3D render, cinematic lighting, professional composition, highly detailed`;
 }
 
@@ -274,554 +245,228 @@ Rules:
 // ============================================================
 
 async function generateImage(prompt) {
-  console.log("🎨 ساخت تصویر با FLUX.2...");
+  console.log("🎨 ساخت تصویر با FLUX.2 Klein...");
   console.log("🖼 Prompt:", prompt);
 
-  const FormData = require("form-data");
-  const form = new FormData();
+  try {
+    const form = new FormData();
+    form.append("prompt", prompt);
+    form.append("width", "1024");
+    form.append("height", "1024");
 
-  form.append("prompt", prompt);
-  form.append("width", "1024");
-  form.append("height", "1024");
-
-  const response = await axios.post(
-    `https://api.cloudflare.com/client/v4/accounts/${cloudflareAccountId}/ai/run/@cf/black-forest-labs/flux-2-klein-4b`,
-    form,
-    {
-      headers: {
-        Authorization: `Bearer ${cloudflareApiToken}`,
-        ...form.getHeaders()
-      },
-      timeout: 180000,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity
-    }
-  );
-
-  if (response.data?.success !== true) {
-    console.error(
-      "❌ Cloudflare Error:",
-      JSON.stringify(response.data, null, 2)
+    const response = await axios.post(
+      `${CF_AI_BASE}/${IMAGE_MODEL}`,
+      form,
+      {
+        headers: {
+          Authorization: `Bearer ${cloudflareApiToken}`,
+          ...form.getHeaders()
+        },
+        timeout: 180000,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity
+      }
     );
 
-    throw new Error("Cloudflare image generation failed");
-  }
-
-  const image = response.data?.result?.image;
-
-  if (!image) {
-    throw new Error("تصویر از Cloudflare دریافت نشد.");
-  }
-
-  console.log("✅ تصویر از Cloudflare دریافت شد");
-  console.log("📦 Base64:", image.length);
-
-  return image;
-}
-
-// ============================================================
-// QWEN CHAT
-// ============================================================
-
-async function askQwen(userMessage) {
- await sleep(100);
-  const response = await axios.post(
-    "https://api.b.ai/v1/chat/completions",
-    {
-      model: "qwen3.8-flash",
-
-      messages: [
-        {
-          role: "system",
-          content: `
-تو «سیباچت» هستی؛ یک دستیار هوش مصنوعی فارسی‌زبان داخل روبیکا.
-
-قوانین:
-- فارسی و طبیعی پاسخ بده.
-- دقیق و مفید باش.
-- خودت را GPT یا ChatGPT معرفی نکن.
-- اگر درباره مدل سؤال شد، بگو موتور گفت‌وگوی سیباچت بر پایه Qwen اجرا می‌شود.
-- اگر کاربر درخواست تولید تصویر داد، این پیام نباید به این بخش برسد.
-- پاسخ‌ها را تا حد امکان خوانا و مرتب بنویس.
-`
-        },
-
-        {
-          role: "user",
-          content: userMessage
-        }
-      ]
-    },
-
-    {
-      headers: {
-        Authorization: `Bearer ${baiApiKey}`,
-        "Content-Type": "application/json"
-      },
-
-      timeout: 180000
+    if (response.data?.success !== true) {
+      throw new Error(JSON.stringify(response.data));
     }
-  );
 
-  const answer =
-    response.data?.choices?.[0]?.message?.content?.trim();
+    const image = response.data?.result?.image;
+    if (!image) throw new Error("تصویر از Cloudflare دریافت نشد.");
 
-  return answer || "نتونستم پاسخ مناسبی تولید کنم.";
+    console.log("✅ تصویر از Cloudflare دریافت شد");
+    return image;
+
+  } catch (error) {
+    const msg = error.response?.data || error.message;
+    console.error("❌ خطا در تولید تصویر:", msg);
+    throw new Error("خطا در تولید تصویر.");
+  }
 }
 
 // ============================================================
-// RUBIKA SEND MESSAGE
+// RUBIKA API WRAPPERS
 // ============================================================
 
 async function sendMessage(chatId, text) {
-  const response = await axios.post(
-    `${rubikaBase}/sendMessage`,
-    {
-      chat_id: chatId,
-      text: safeString(text)
-    },
-    {
-      timeout: 30000
-    }
-  );
-
-  if (
-    response.data?.status &&
-    response.data.status !== "OK"
-  ) {
-    throw new Error(
-      response.data?.message ||
-      response.data?.status ||
-      "sendMessage failed"
+  try {
+    const response = await axios.post(
+      `${RUBIKA_BASE}/sendMessage`,
+      { chat_id: chatId, text: safeString(text) },
+      { timeout: 30000 }
     );
-  }
 
-  return response.data;
+    if (response.data?.status && response.data.status !== "OK") {
+      throw new Error(response.data?.message || response.data?.status || "sendMessage failed");
+    }
+
+    return response.data;
+  } catch (error) {
+    console.error("❌ خطا در ارسال پیام:", error.response?.data || error.message);
+    throw error;
+  }
 }
 
-// ============================================================
-// RUBIKA REQUEST SEND FILE
-// ============================================================
 async function requestSendFile() {
-
   console.log("📤 درخواست آپلود فایل...");
 
-  const response = await axios.post(
-    `${rubikaBase}/requestSendFile`,
-    {
-      type: "Image"
-    },
-    {
-      timeout: 60000
-    }
-  );
-
-  console.log(
-    "📡 پاسخ requestSendFile:",
-    JSON.stringify(response.data, null, 2)
-  );
-
-  if (response.data?.status !== "OK") {
-    throw new Error(
-      "requestSendFile failed: " +
-      JSON.stringify(response.data)
+  try {
+    const response = await axios.post(
+      `${RUBIKA_BASE}/requestSendFile`,
+      { type: "Image" },
+      { timeout: 60000 }
     );
-  }
 
-  return response.data;
+    if (response.data?.status !== "OK") {
+      throw new Error("requestSendFile failed: " + JSON.stringify(response.data));
+    }
+
+    return response.data;
+  } catch (error) {
+    console.error("❌ خطا در requestSendFile:", error.response?.data || error.message);
+    throw error;
+  }
 }
 
-
-// ============================================================
-// RUBIKA UPLOAD FILE
-// ============================================================
-
 async function uploadFile(filePath, uploadInfo) {
-
   const fileBuffer = fs.readFileSync(filePath);
+  const uploadUrl = uploadInfo?.data?.upload_url;
 
-  const uploadUrl =
-    uploadInfo?.data?.upload_url;
-
-  if (!uploadUrl) {
-    throw new Error("upload_url پیدا نشد");
-  }
-
+  if (!uploadUrl) throw new Error("upload_url پیدا نشد");
 
   console.log("⬆️ آپلود multipart به روبیکا...");
 
-
   const form = new FormData();
-
-  form.append(
-    "file",
-    fileBuffer,
-    {
-      filename: path.basename(filePath),
-      contentType: "image/png"
-    }
-  );
-
-
-  const response = await axios.post(
-    uploadUrl,
-    form,
-    {
-      headers: {
-        ...form.getHeaders()
-      },
-
-      timeout:120000,
-
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-
-      validateStatus: () => true
-    }
-  );
-
-
-  console.log(
-    "📡 HTTP:",
-    response.status
-  );
-
-  console.log(
-    "📡 Upload:",
-    JSON.stringify(
-      response.data,
-      null,
-      2
-    )
-  );
-
-
-  return response.data;
-}
-// ============================================================
-// RUBIKA SEND FILE
-// ============================================================
-
-async function sendFile(
-  chatId,
-  fileId,
-  caption = ""
-) {
-  console.log("📤 ارسال فایل به روبیکا...");
-  console.log("🆔 file_id:", fileId);
-
-  const response = await axios.post(
-    `${rubikaBase}/sendFile`,
-    {
-      chat_id: chatId,
-      file_id: String(fileId),
-      text: caption
-    },
-    {
-      timeout: 60000
-    }
-  );
-
-  console.log("📡 پاسخ sendFile:");
-  console.log(
-    JSON.stringify(response.data, null, 2)
-  );
-
-  if (
-    response.data?.status &&
-    response.data.status !== "OK"
-  ) {
-    throw new Error(
-      response.data?.message ||
-      response.data?.status ||
-      "sendFile failed"
-    );
-  }
-
-  return response.data;
-}
-
-// ============================================================
-// SAVE + UPLOAD + SEND GENERATED IMAGE
-// ============================================================
-async function sendGeneratedImage(
-  chatId,
-  imageBase64
-) {
-
-  const buffer = Buffer.from(
-    imageBase64,
-    "base64"
-  );
-
-
-  fs.writeFileSync(
-    GENERATED_IMAGE_FILE,
-    buffer
-  );
-
-
-  console.log(
-    "💾 تصویر ذخیره شد:",
-    GENERATED_IMAGE_FILE
-  );
-
+  form.append("file", fileBuffer, {
+    filename: path.basename(filePath),
+    contentType: "image/png"
+  });
 
   try {
+    const response = await axios.post(uploadUrl, form, {
+      headers: { ...form.getHeaders() },
+      timeout: 120000,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      validateStatus: () => true
+    });
 
-    const uploadInfo =
-      await requestSendFile();
+    console.log("📡 Upload HTTP:", response.status);
+    return response.data;
+  } catch (error) {
+    console.error("❌ خطا در آپلود فایل:", error.message);
+    throw error;
+  }
+}
 
+async function sendFile(chatId, fileId, caption = "") {
+  console.log("📤 ارسال فایل به روبیکا...", fileId);
 
-    const uploadResult =
-      await uploadFile(
-        GENERATED_IMAGE_FILE,
-        uploadInfo
-      );
-
-
-    console.log(
-      "📦 نتیجه آپلود:",
-      JSON.stringify(
-        uploadResult,
-        null,
-        2
-      )
+  try {
+    const response = await axios.post(
+      `${RUBIKA_BASE}/sendFile`,
+      { chat_id: chatId, file_id: String(fileId), text: caption },
+      { timeout: 60000 }
     );
 
+    if (response.data?.status && response.data.status !== "OK") {
+      throw new Error(response.data?.message || response.data?.status || "sendFile failed");
+    }
+
+    return response.data;
+  } catch (error) {
+    console.error("❌ خطا در sendFile:", error.response?.data || error.message);
+    throw error;
+  }
+}
+
+async function getUpdates() {
+  const body = { limit: 10 };
+  if (offsetId) body.offset_id = offsetId;
+
+  const response = await axios.post(`${RUBIKA_BASE}/getUpdates`, body, { timeout: 60000 });
+  return response.data;
+}
+
+// ============================================================
+// SEND GENERATED IMAGE PIPELINE
+// ============================================================
+
+async function sendGeneratedImage(chatId, imageBase64) {
+  const buffer = Buffer.from(imageBase64, "base64");
+  fs.writeFileSync(GENERATED_IMAGE_FILE, buffer);
+  console.log("💾 تصویر ذخیره شد:", GENERATED_IMAGE_FILE);
+
+  try {
+    const uploadInfo = await requestSendFile();
+    const uploadResult = await uploadFile(GENERATED_IMAGE_FILE, uploadInfo);
 
     const fileId =
       uploadResult?.data?.file_id ||
       uploadResult?.file_id ||
       uploadResult?.id;
 
+    if (!fileId) throw new Error("file_id پیدا نشد");
 
-    if (!fileId) {
-
-      throw new Error(
-        "file_id پیدا نشد"
-      );
-
-    }
-
-
-    await sendFile(
-      chatId,
-      fileId,
-      "✨ تصویر ساخته‌شده توسط سیباچت"
-    );
-
-
-    console.log(
-      "✅ تصویر ارسال شد"
-    );
-
-
-  } catch(error) {
-
-    console.error(
-      "❌ ارسال تصویر:",
-      error.message
-    );
-
-    throw error;
-
-
+    await sendFile(chatId, fileId, "✨ تصویر ساخته‌شده توسط سیباچت");
+    console.log("✅ تصویر ارسال شد");
   } finally {
-
     try {
-
-      if(
-        fs.existsSync(
-          GENERATED_IMAGE_FILE
-        )
-      ){
-
-        fs.unlinkSync(
-          GENERATED_IMAGE_FILE
-        );
-
+      if (fs.existsSync(GENERATED_IMAGE_FILE)) {
+        fs.unlinkSync(GENERATED_IMAGE_FILE);
       }
-
-    } catch(e){}
-
+    } catch (_) {}
   }
-}
-      
-
-// ============================================================
-// GET UPDATES
-// ============================================================
-
-async function getUpdates() {
-  const body = {
-    limit: 10
-  };
-
-  if (offsetId) {
-    body.offset_id = offsetId;
-  }
-
-  const response = await axios.post(
-    `${rubikaBase}/getUpdates`,
-    body,
-    {
-      timeout: 60000
-    }
-  );
-
-  return response.data;
 }
 
 // ============================================================
 // PROCESS MESSAGE
 // ============================================================
 
-async function processMessage(
-  chatId,
-  userText
-) {
-  const imageRequest =
-    isImageRequest(userText);
+async function processMessage(chatId, userText) {
+  const imageRequest = isImageRequest(userText);
+  console.log("🔍 IMAGE CHECK:", imageRequest);
+  console.log("USER TEXT DEBUG:", JSON.stringify(userText));
 
-  console.log(
-    "🔍 IMAGE CHECK:",
-    imageRequest
-  );
-console.log("USER TEXT DEBUG:", JSON.stringify(userText));
-
-  // ==========================================================
-  // IMAGE MODE
-  // ==========================================================
-
+  // ===================== IMAGE MODE =====================
   if (imageRequest) {
     console.log("🔥 IMAGE MODE");
 
     try {
-      await sendMessage(
-        chatId,
-        "🎨 درخواست تصویر شناسایی شد...\n\n⏳ در حال آماده‌سازی تصویر"
-      );
+      await sendMessage(chatId, "🎨 درخواست تصویر شناسایی شد...\n\n⏳ در حال آماده‌سازی تصویر");
 
-      // ------------------------------------------------------
-      // Prompt
-      // ------------------------------------------------------
+      const imagePrompt = await createImagePrompt(userText);
+      console.log("🖼 Prompt نهایی:", imagePrompt);
 
-      const imagePrompt =
-        await createImagePrompt(
-          userText
-        );
+      await sendMessage(chatId, "✨ پرامپت آماده شد.\n\n🧠 در حال تولید تصویر...");
 
-      console.log(
-        "🖼 Prompt نهایی:"
-      );
+      const imageBase64 = await generateImage(imagePrompt);
+      console.log("✅ تولید تصویر موفق بود");
 
-      console.log(
-        imagePrompt
-      );
-
-      await sendMessage(
-        chatId,
-        "✨ پرامپت آماده شد.\n\n🧠 در حال تولید تصویر..."
-      );
-
-      // ------------------------------------------------------
-      // FLUX
-      // ------------------------------------------------------
-
-      const imageBase64 =
-        await generateImage(
-          imagePrompt
-        );
-
-      console.log(
-        "✅ تولید تصویر موفق بود"
-      );
-
-      await sendMessage(
-        chatId,
-        "📦 تصویر ساخته شد؛ در حال ارسال به روبیکا..."
-      );
-
-      // ------------------------------------------------------
-      // Rubika
-      // ------------------------------------------------------
-
-      await sendGeneratedImage(
-        chatId,
-        imageBase64
-      );
-
-      await sendMessage(
-        chatId,
-        "✅ تصویر با موفقیت ارسال شد! 🎉"
-      );
-
-      return;
+      await sendMessage(chatId, "📦 تصویر ساخته شد؛ در حال ارسال به روبیکا...");
+      await sendGeneratedImage(chatId, imageBase64);
+      await sendMessage(chatId, "✅ تصویر با موفقیت ارسال شد! 🎉");
     } catch (error) {
-      console.error(
-        "❌ IMAGE ERROR:"
-      );
-
-      console.error(
-        error.response?.data ||
-        error.message
-      );
-
+      console.error("❌ IMAGE ERROR:", error.response?.data || error.message);
       try {
-        await sendMessage(
-          chatId,
-          "❌ در تولید یا ارسال تصویر مشکلی پیش آمد.\n\nلطفاً دوباره امتحان کن."
-        );
+        await sendMessage(chatId, "❌ در تولید یا ارسال تصویر مشکلی پیش آمد.\n\nلطفاً دوباره امتحان کن.");
       } catch (_) {}
-
-      return;
     }
+    return;
   }
 
-  // ==========================================================
-  // NORMAL CHAT MODE
-  // ==========================================================
-
+  // ===================== CHAT MODE =====================
   try {
-    await sendMessage(
-      chatId,
-      "⏳ در حال فکر کردن..."
-    );
-
-    const answer =
-      await askQwen(
-        userText
-      );
-
-    console.log(
-      "🧠 پاسخ Qwen:",
-      answer
-    );
-
-    await sendMessage(
-      chatId,
-      answer
-    );
-
-    console.log(
-      "📤 پاسخ ارسال شد"
-    );
+    await sendMessage(chatId, "⏳ در حال فکر کردن...");
+    const answer = await askAI(userText);
+    console.log("🧠 پاسخ SIBA:", answer);
+    await sendMessage(chatId, answer);
+    console.log("📤 پاسخ ارسال شد");
   } catch (error) {
-    console.error(
-      "❌ QWEN ERROR:"
-    );
-
-    console.error(
-      error.response?.data ||
-      error.message
-    );
-
+    console.error("❌ AI ERROR:", error.response?.data || error.message);
     try {
-      await sendMessage(
-        chatId,
-        "❌ در پردازش درخواست مشکلی پیش آمد.\n\nدوباره امتحان کن."
-      );
+      await sendMessage(chatId, "❌ در پردازش درخواست مشکلی پیش آمد.\n\nدوباره امتحان کن.");
     } catch (_) {}
   }
 }
@@ -833,25 +478,14 @@ console.log("USER TEXT DEBUG:", JSON.stringify(userText));
 async function startBot() {
   console.log("🤖 سیباچت در حال اجراست...");
 
-  // ----------------------------------------------------------
-  // Startup drain:
-  // پیام‌های قبلی را فقط می‌خوانیم و offset را جلو می‌بریم،
-  // ولی آنها را پردازش نمی‌کنیم.
-  // وقتی صف خالی شد، از آن لحظه پیام‌های جدید پردازش می‌شوند.
-  // ----------------------------------------------------------
-
+  // Drain old messages on startup
   let initialized = false;
-
   while (!initialized) {
     try {
       const result = await getUpdates();
 
       if (result?.status !== "OK") {
-        console.log(
-          "⚠️ Startup getUpdates:",
-          JSON.stringify(result, null, 2)
-        );
-
+        console.log("⚠️ Startup getUpdates:", JSON.stringify(result, null, 2));
         await sleep(3000);
         continue;
       }
@@ -859,7 +493,6 @@ async function startBot() {
       const updates = result.data?.updates || [];
       const nextOffsetId = result.data?.next_offset_id || null;
 
-      // Offset را جلو می‌بریم تا پیام‌های موجود دوباره برنگردند
       if (nextOffsetId) {
         offsetId = nextOffsetId;
         saveOffset(offsetId);
@@ -867,44 +500,24 @@ async function startBot() {
 
       if (updates.length === 0) {
         initialized = true;
-
-        console.log(
-          "✅ صف پیام‌های قبلی خالی شد."
-        );
-
-        console.log(
-          "🟢 سیباچت از این لحظه پیام‌های جدید را پردازش می‌کند."
-        );
+        console.log("✅ صف پیام‌های قبلی خالی شد.");
+        console.log("🟢 سیباچت از این لحظه پیام‌های جدید را پردازش می‌کند.");
       } else {
-        console.log(
-          `⏭ ${updates.length} پیام قدیمی رد شد.`
-        );
+        console.log(`⏭ ${updates.length} پیام قدیمی رد شد.`);
       }
-
     } catch (error) {
-      console.error(
-        "❌ خطا هنگام پاک‌سازی صف قدیمی:",
-        error.response?.data || error.message
-      );
-
+      console.error("❌ خطا هنگام پاک‌سازی صف قدیمی:", error.response?.data || error.message);
       await sleep(3000);
     }
   }
 
-  // ----------------------------------------------------------
-  // MAIN LOOP
-  // ----------------------------------------------------------
-
+  // Main polling loop
   while (true) {
     try {
       const result = await getUpdates();
 
       if (result?.status !== "OK") {
-        console.log(
-          "⚠️ getUpdates:",
-          JSON.stringify(result, null, 2)
-        );
-
+        console.log("⚠️ getUpdates:", JSON.stringify(result, null, 2));
         await sleep(3000);
         continue;
       }
@@ -912,63 +525,30 @@ async function startBot() {
       const updates = result.data?.updates || [];
       const nextOffsetId = result.data?.next_offset_id || null;
 
-      // Offset جدید
       if (nextOffsetId) {
         offsetId = nextOffsetId;
         saveOffset(offsetId);
       }
 
-      // هیچ پیام جدیدی نیست
-      if (updates.length === 0) {
-        continue;
-      }
-
-      // --------------------------------------------------------
-      // PROCESS NEW MESSAGES
-      // --------------------------------------------------------
+      if (updates.length === 0) continue;
 
       for (const update of updates) {
-        if (update.type !== "NewMessage") {
-          continue;
-        }
+        if (update.type !== "NewMessage") continue;
 
         const chatId = update.chat_id;
+        const userText = update.new_message?.text?.trim();
 
-        const userText =
-          update.new_message?.text?.trim();
+        if (!chatId || !userText) continue;
 
-        if (!chatId || !userText) {
-          continue;
-        }
+        console.log(`📩 پیام جدید: ${userText}`);
 
-        console.log(
-          `📩 پیام جدید: ${userText}`
-        );
-
-       processMessage(
-  chatId,
-  userText
-).catch(error => {
-  console.error(
-    "❌ خطای پردازش پیام:",
-    error.response?.data ||
-    error.message
-  );
-
-  sendMessage(
-    chatId,
-    "❌ در پردازش پیام مشکلی پیش آمد."
-  ).catch(() => {});
-});
+        processMessage(chatId, userText).catch((error) => {
+          console.error("❌ خطای پردازش پیام:", error.response?.data || error.message);
+          sendMessage(chatId, "❌ در پردازش پیام مشکلی پیش آمد.").catch(() => {});
+        });
       }
-
     } catch (error) {
-      console.error(
-        "❌ خطا در دریافت پیام‌ها:",
-        error.response?.data ||
-        error.message
-      );
-
+      console.error("❌ خطا در دریافت پیام‌ها:", error.response?.data || error.message);
       await sleep(3000);
     }
   }
